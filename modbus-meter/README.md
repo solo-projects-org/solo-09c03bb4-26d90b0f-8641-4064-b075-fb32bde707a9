@@ -1,9 +1,14 @@
-# Modbus TCP 电表试采接口
+# Modbus TCP 电表试采与能耗小时留档接口
 
-新电表接入能耗库前的单台 Modbus TCP 电表试采服务：厂务工程师提交测点的
-保持寄存器起始地址（从 0 算）与字数（1 或 2），并给出设备的可读区间
-（含两端）与单次读取上限；接口自动规划读段、按方案读表，返回读段与
-无符号计数（双字按高字在前拼接）。
+两部分功能：
+
+1. **试采**：新电表接入能耗库前的单台 Modbus TCP 电表试采服务。厂务工程师提交
+   测点的保持寄存器起始地址（从 0 算）与字数（1 或 2），并给出设备的可读区间
+   （含两端）与单次读取上限；接口自动规划读段、按方案读表，返回读段与无符号
+   计数（双字按高字在前拼接）。
+2. **能耗小时留档**：网关按表号批量补报分钟明细；过了补报期限后，厂务数仓
+   值班员为单表指定 UTC 整点截止点，把此前的明细按小时汇总留档后删除（明细
+   清了，能耗库仍能查到每小时的用电量和缺报情况）。
 
 ## 快速开始（Docker Compose）
 
@@ -13,6 +18,8 @@ docker compose up --build
 
 - API：<http://localhost:8000>，Swagger UI：<http://localhost:8000/docs>
 - 模拟电表：`localhost:1502`（容器内 `meter:502`），保持寄存器 0..99
+- 能耗库：SQLite 文件 `/data/energy.db`，挂在命名卷 `energy-data` 上，
+  容器重建不丢留档
 
 在 Swagger 中打开 `POST /read` → Try it out → 直接 Execute 即可对模拟表试采
 （请求体默认指向容器内的模拟表）。也可在宿主机用 curl：
@@ -33,9 +40,71 @@ curl -X POST http://localhost:8000/read \
   }'
 ```
 
-## 接口说明
+## 能耗小时留档 API
 
-### `POST /read`
+时间一律用 UTC 秒：分钟明细的 `minute_start` 须为 60 的整数倍，截止点与查询
+区间须为 3600 的整数倍（UTC 整点）。下面样例中
+`1767225600` = 2026-01-01T00:00:00Z。
+
+### `POST /meters/{meter_id}/minutes` —— 网关批量补报分钟明细
+
+每条含分钟起始 UTC 秒和非负整数 Wh；同一分钟以最后写入的值为准（同批内
+重复或跨批覆盖都生效）。
+
+```bash
+curl -X POST http://localhost:8000/meters/MTR-001/minutes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "records": [
+      {"minute_start": 1767225600, "wh": 120},
+      {"minute_start": 1767225660, "wh": 118},
+      {"minute_start": 1767225720, "wh": 121},
+      {"minute_start": 1767229200, "wh": 130},
+      {"minute_start": 1767229260, "wh": 128}
+    ]
+  }'
+# {"meter_id":"MTR-001","accepted":5,"cutoff_hour":null}
+```
+
+截止点生效后，批次只要含一条更早的分钟就**整批拒收**（`409`，批次中的有效
+分钟也不会写入）；恰好等于截止点的分钟允许写入。
+
+### `POST /meters/{meter_id}/cleanup` —— 清理：按小时留档后删除明细
+
+值班员为单表指定 UTC 整点截止点，把此前的明细按小时汇总（Wh 合计 + 已报
+分钟数）留档后删除。汇总、删除和截止点推进在 SQLite 同一事务中生效，失败
+则原数据不变；截止点只进不退（回退返回 `409`，同一截止点重试幂等）。
+
+```bash
+curl -X POST http://localhost:8000/meters/MTR-001/cleanup \
+  -H 'Content-Type: application/json' \
+  -d '{"cutoff_hour": 1767232800}'   # 2026-01-01T02:00:00Z
+# {"meter_id":"MTR-001","cutoff_hour":1767232800,"aggregated_hours":2,
+#  "deleted_details":5,"hours":[
+#    {"hour_start":1767225600,"wh_total":359,"reported_minutes":3},
+#    {"hour_start":1767229200,"wh_total":258,"reported_minutes":2}]}
+```
+
+### `GET /meters/{meter_id}/hourly` —— 按 UTC 整点区间逐小时查询
+
+含起点、不含终点；逐小时返回 Wh 合计和已报分钟数（缺报情况 = 60 − 已报
+分钟数），整小时没有记录时合计为 `null`。留档与明细在同一事务快照中合并，
+跨截止点查询也只能看到同一份已提交数据——清理前后查同一区间结果一致。
+
+```bash
+curl 'http://localhost:8000/meters/MTR-001/hourly?start=1767225600&end=1767236400'
+# {"meter_id":"MTR-001","start":1767225600,"end":1767236400,
+#  "cutoff_hour":1767232800,"hours":[
+#    {"hour_start":1767225600,"wh_total":359,"reported_minutes":3},
+#    {"hour_start":1767229200,"wh_total":258,"reported_minutes":2},
+#    {"hour_start":1767232800,"wh_total":null,"reported_minutes":0}]}
+```
+
+错误码：`422` 参数校验失败（未对齐整分钟/整点、Wh 为负、区间终点不大于
+起点、跨度超过 8784 小时等）；`409` 截止点回退或补报含过期分钟；
+`500` 存储层失败（已回滚，原数据不变）。
+
+## 接口说明：`POST /read`
 
 请求体：
 
@@ -82,19 +151,22 @@ curl -X POST http://localhost:8000/read \
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 METER_PORT=1502 .venv/bin/python -m simulator.meter_sim &
-METER_HOST=127.0.0.1 METER_PORT=1502 .venv/bin/uvicorn app.main:app --port 8000
-.venv/bin/pytest            # 13 个用例：规划算法 + API 集成
+ENERGY_DB_PATH=./energy.db METER_HOST=127.0.0.1 METER_PORT=1502 \
+  .venv/bin/uvicorn app.main:app --port 8000
+.venv/bin/pytest            # 21 个用例：规划算法 + 试采集成 + 小时留档
 ```
 
 环境变量：`METER_HOST` / `METER_PORT` / `METER_SLAVE_ID` / `METER_TIMEOUT`
-为 API 请求体连接参数的默认值（Compose 中已注入）。
+为试采请求体连接参数的默认值；`ENERGY_DB_PATH` 为能耗 SQLite 库路径
+（Compose 中为 `/data/energy.db`，缺省为内存库，重启即清空）。
 
 ## 目录结构
 
 ```
-app/main.py        FastAPI 接口与读表执行
+app/main.py        FastAPI 接口：/read 试采 + 分钟明细/清理/小时查询
 app/planner.py     读段规划（动态规划：次数最少 -> 寄存器总数最少）
+app/energy_db.py   能耗 SQLite 存储：分钟明细、小时留档、清理截止点（事务）
 simulator/         pymodbus 内存模拟电表
-tests/             规划单元测试 + API 集成测试（内存模拟表，无需 Docker）
-docker-compose.yml api + meter 两个服务
+tests/             规划单元测试 + API 集成测试（内存模拟表/临时库，无需 Docker）
+docker-compose.yml api + meter 两个服务，energy-data 卷持久化能耗库
 ```
